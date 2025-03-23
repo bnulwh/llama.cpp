@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
+# 功能：将 Hugging Face 的 PEFT LoRA 适配器转换为 GGUF 格式，支持 llama.cpp 推理框架。
+# 输入：LoRA 适配器的配置文件（adapter_config.json）和权重文件（adleters）。
+# 输出：GGUF 格式的适配器文件。
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -34,7 +36,11 @@ class PartialLoraTensor:
     A: Tensor | None = None
     B: Tensor | None = None
 
-
+# 作用：封装 LoRA 的两个低秩矩阵，支持切片、重塑、转置等张量操作。
+# 关键方法：
+# __getitem__：处理多维切片，适配不同形状的输入。
+# reshape：调整矩阵形状，确保与基础模型兼容。
+# permute/transpose：调整矩阵维度顺序。
 # magic to support tensor shape modifications and splitting
 class LoraTorchTensor:
     _lora_A: Tensor  # (n_rank, row_size)
@@ -42,14 +48,15 @@ class LoraTorchTensor:
     _rank: int
 
     def __init__(self, A: Tensor, B: Tensor):
+        # 初始化 LoRA 的 A 和 B 矩阵
         assert len(A.shape) == len(B.shape)
         assert A.shape[-2] == B.shape[-1]
         if A.dtype != B.dtype:
             A = A.to(torch.float32)
             B = B.to(torch.float32)
-        self._lora_A = A
-        self._lora_B = B
-        self._rank = B.shape[-1]
+        self._lora_A = A# 低秩矩阵 A（形状：n_rank × row_size）
+        self._lora_B = B# 低秩矩阵 B（形状：col_size × n_rank）
+        self._rank = B.shape[-1]# LoRA 的秩
 
     def get_lora_A_B(self) -> tuple[Tensor, Tensor]:
         return (self._lora_A, self._lora_B)
@@ -221,7 +228,9 @@ class LoraTorchTensor:
         else:
             raise NotImplementedError
 
-
+# 功能：从 LoRA 张量名称中提取基础模型的对应张量名称。
+# 示例：
+# base_model.model.layers.0.self_attn.q_proj.lora_A.weight → layers.0.self_attn.q_proj.weight
 def get_base_tensor_name(lora_tensor_name: str) -> str:
     base_name = lora_tensor_name.replace("base_model.model.", "")
     base_name = base_name.replace(".lora_A.weight", ".weight")
@@ -233,6 +242,10 @@ def get_base_tensor_name(lora_tensor_name: str) -> str:
 
 
 def parse_args() -> argparse.Namespace:
+    # 参数说明：
+    # --outtype：指定输出格式（如 f16 表示半精度浮点数）。
+    # --base：基础模型的配置文件路径（如 config.json）。
+    # lora_path：包含 LoRA 配置和权重的目录。
     parser = argparse.ArgumentParser(
         description="Convert a Hugging Face PEFT LoRA adapter to a GGUF file")
     parser.add_argument(
@@ -282,6 +295,32 @@ def load_hparams_from_hf(hf_model_id: str) -> dict[str, Any]:
 
 
 if __name__ == '__main__':
+    # 流程：
+    # 解析参数：获取输入路径、输出格式等配置。
+    # 加载 LoRA 数据：包括配置文件和权重文件。
+    # 加载基础模型配置：从本地或 Hugging Face Hub 获取。
+    # 构建适配器模型：合并 LoRA 张量并调整格式。
+    # 写入 GGUF 文件：最终生成适配器文件。
+    # 
+    # 张量操作兼容性：
+    #   LoraTorchTensor 类模拟 PyTorch 张量操作，确保与基础模型兼容。
+    #   支持多维切片、重塑、转置等操作，适配不同模型架构。
+    # 格式转换：
+    #   将 LoRA 的 A 和 B 矩阵转换为 GGUF 格式的 .lora_a 和 .lora_b 张量。
+    #   处理词嵌入层的特殊转置需求（如 token_embd.weight.lora_a）。
+    # 错误处理：
+    #   检测无效的 LoRA 张量名称（如非预期的嵌入层或未匹配的 A/B 矩阵）。
+    #   支持干运行模式（--dry-run）以验证配置。
+    # 示例命令
+    #  python convert_lora_to_gguf.py \
+    #    --base ./base_model \
+    #    --outtype f16 \
+    #    --outfile ./output/lora_adapter.gguf \
+    #    ./lora_adapter
+    # 参数说明：
+    # --base：基础模型的配置文件目录。
+    # --outtype：输出格式为半精度浮点数。
+    # lora_adapter：包含 adapter_config.json 和 adapter_model.safetensors 的目录。
     args = parse_args()
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO)
 
@@ -298,6 +337,7 @@ if __name__ == '__main__':
     dir_base_model: Path | None = args.base
     dir_lora: Path = args.lora_path
     base_model_id: str | None = args.base_model_id
+    # 加载 LoRA 适配器配置和权重
     lora_config = dir_lora / "adapter_config.json"
     input_model = dir_lora / "adapter_model.safetensors"
 
@@ -306,7 +346,7 @@ if __name__ == '__main__':
     else:
         # output in the same directory as the model by default
         fname_out = dir_lora
-
+# 使用 safetensors 或 torch.load
     if os.path.exists(input_model):
         # lazy import load_file only if lora is in safetensors format.
         from safetensors.torch import load_file
@@ -321,6 +361,7 @@ if __name__ == '__main__':
         lparams: dict[str, Any] = json.load(f)
 
     # load base model
+    # 加载基础模型配置
     if base_model_id is not None:
         logger.info(f"Loading base model from Hugging Face: {base_model_id}")
         hparams = load_hparams_from_hf(base_model_id)
@@ -349,6 +390,10 @@ if __name__ == '__main__':
             logger.error(f"Model {hparams['architectures'][0]} is not supported")
             sys.exit(1)
 
+        # 功能：继承基础模型类，覆盖张量处理逻辑以适配 LoRA 结构。
+        # 关键步骤：
+        # 设置 GGUF 类型：标记为适配器，类型为 lora。
+        # 处理张量：合并 A 和 B 矩阵，并根据基础模型调整形状。
         class LoraModel(model_class):
             model_arch = model_class.model_arch
 
@@ -359,7 +404,7 @@ if __name__ == '__main__':
                 super().__init__(*args, **kwargs)
 
                 self.dir_model_card = dir_lora_model
-                self.lora_alpha = float(lora_alpha)
+                self.lora_alpha = float(lora_alpha)# LoRA 的缩放系数（alpha）
 
             def set_vocab(self):
                 pass
@@ -377,7 +422,7 @@ if __name__ == '__main__':
 
             def get_tensors(self) -> Iterator[tuple[str, Tensor]]:
                 tensor_map: dict[str, PartialLoraTensor] = {}
-
+                # 遍历 LoRA 张量，提取 A 和 B 矩阵
                 for name, tensor in lora_model.items():
                     if self.lazy:
                         tensor = LazyTorchTensor.from_eager(tensor)
@@ -408,7 +453,7 @@ if __name__ == '__main__':
                             tensor_map[base_name] = PartialLoraTensor(A=tensor)
                         else:
                             tensor_map[base_name] = PartialLoraTensor(B=tensor)
-
+                # 合并 A 和 B 矩阵为 LoraTorchTensor
                 for name, tensor in tensor_map.items():
                     assert tensor.A is not None
                     assert tensor.B is not None
@@ -443,6 +488,7 @@ if __name__ == '__main__':
 
         alpha: float = lparams["lora_alpha"]
 
+        # 构建 LoraModel 实例并写入 GGUF 文件
         model_instance = LoraModel(
             dir_base_model,
             ftype,
